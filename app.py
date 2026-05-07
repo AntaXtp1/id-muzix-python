@@ -42,21 +42,52 @@ def trending():
         return jsonify(cached)
 
     try:
-        # Chart lagu Indonesia
         charts = ytmusic.get_charts(country="ID")
-        songs  = charts.get("songs", {}).get("items", [])
+
+        # Defensif — struktur bisa beda tiap versi ytmusicapi
+        songs_raw = charts.get("songs") or {}
+        if isinstance(songs_raw, dict):
+            items = songs_raw.get("items") or songs_raw.get("content") or []
+        elif isinstance(songs_raw, list):
+            items = songs_raw
+        else:
+            items = []
+
+        # Fallback ke trending jika songs kosong
+        if not items:
+            trending_raw = charts.get("trending") or {}
+            if isinstance(trending_raw, dict):
+                items = trending_raw.get("items") or trending_raw.get("content") or []
+            elif isinstance(trending_raw, list):
+                items = trending_raw
 
         result = []
-        for i, song in enumerate(songs[:20]):  # ambil top 20
+        for i, song in enumerate(items[:20]):
             try:
-                title     = song.get("title", "")
-                artists   = song.get("artists", [])
-                artist    = artists[0]["name"] if artists else ""
-                videoId   = song.get("videoId", "")
-                thumbnails = song.get("thumbnails", [])
-                thumbnail  = thumbnails[-1]["url"] if thumbnails else ""
-                album_obj  = song.get("album") or {}
-                album      = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
+                if not isinstance(song, dict):
+                    continue
+
+                title = song.get("title") or ""
+
+                # artists bisa list of dict atau string
+                artists = song.get("artists") or []
+                if isinstance(artists, list) and artists:
+                    first = artists[0]
+                    artist = first.get("name", "") if isinstance(first, dict) else str(first)
+                else:
+                    artist = ""
+
+                videoId = song.get("videoId") or ""
+
+                # thumbnails bisa di key "thumbnails" atau "thumbnail"
+                thumbs = song.get("thumbnails") or song.get("thumbnail") or []
+                thumbnail = thumbs[-1]["url"] if thumbs and isinstance(thumbs[-1], dict) else ""
+
+                album_obj = song.get("album") or {}
+                album = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
+
+                if not title:
+                    continue
 
                 result.append({
                     "rank":      i + 1,
@@ -71,7 +102,10 @@ def trending():
                 print(f"[Trending] skip item {i}: {e}")
                 continue
 
-        cache_set("trending_id", result, ttl=1800)  # cache 30 menit
+        if not result:
+            return jsonify({"error": "Trending kosong, cek log container"}), 500
+
+        cache_set("trending_id", result, ttl=1800)
         return jsonify(result)
 
     except Exception as e:

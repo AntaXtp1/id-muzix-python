@@ -34,7 +34,7 @@ def cache_set(key, data, ttl=1800):
 def health():
     return jsonify({"status": "ok", "service": "id-muzix-python"})
 
-# ─── GET /trending — chart Indonesia dari YT Music ───────────────────────────
+# ─── GET /trending — chart Indonesia (Workaround pakai Search) ───────────────
 @app.route("/trending")
 def trending():
     cached = cache_get("trending_id")
@@ -42,48 +42,34 @@ def trending():
         return jsonify(cached)
 
     try:
-        charts = ytmusic.get_charts(country="ID")
+        # WORKAROUND: Kita akali dengan mencari playlist/lagu viral
+        # karena get_charts() sering kosong/diblokir di server
+        results = ytmusic.search("lagu viral tiktok indonesia terbaru", filter="songs", limit=20)
 
-        # Defensif — struktur bisa beda tiap versi ytmusicapi
-        songs_raw = charts.get("songs") or {}
-        if isinstance(songs_raw, dict):
-            items = songs_raw.get("items") or songs_raw.get("content") or []
-        elif isinstance(songs_raw, list):
-            items = songs_raw
-        else:
-            items = []
-
-        # Fallback ke trending jika songs kosong
-        if not items:
-            trending_raw = charts.get("trending") or {}
-            if isinstance(trending_raw, dict):
-                items = trending_raw.get("items") or trending_raw.get("content") or []
-            elif isinstance(trending_raw, list):
-                items = trending_raw
+        if not results:
+            return jsonify({"error": "Trending kosong, pencarian tidak menemukan hasil"}), 500
 
         result = []
-        for i, song in enumerate(items[:20]):
+        for i, song in enumerate(results):
             try:
-                if not isinstance(song, dict):
-                    continue
-
-                title = song.get("title") or ""
-
-                # artists bisa list of dict atau string
-                artists = song.get("artists") or []
+                title = song.get("title", "")
+                
+                # Parsing artist dengan aman
+                artists = song.get("artists", [])
                 if isinstance(artists, list) and artists:
                     first = artists[0]
                     artist = first.get("name", "") if isinstance(first, dict) else str(first)
                 else:
                     artist = ""
 
-                videoId = song.get("videoId") or ""
+                videoId = song.get("videoId", "")
 
-                # thumbnails bisa di key "thumbnails" atau "thumbnail"
-                thumbs = song.get("thumbnails") or song.get("thumbnail") or []
-                thumbnail = thumbs[-1]["url"] if thumbs and isinstance(thumbs[-1], dict) else ""
+                # Parsing thumbnail
+                thumbnails = song.get("thumbnails", [])
+                thumbnail = thumbnails[-1]["url"] if thumbnails and isinstance(thumbnails[-1], dict) else ""
 
-                album_obj = song.get("album") or {}
+                # Parsing album
+                album_obj = song.get("album", {})
                 album = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
 
                 if not title:
@@ -103,9 +89,9 @@ def trending():
                 continue
 
         if not result:
-            return jsonify({"error": "Trending kosong, cek log container"}), 500
+            return jsonify({"error": "Gagal memproses data trending"}), 500
 
-        cache_set("trending_id", result, ttl=1800)
+        cache_set("trending_id", result, ttl=1800) # Cache 30 menit
         return jsonify(result)
 
     except Exception as e:

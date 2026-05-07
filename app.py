@@ -8,7 +8,7 @@ import threading
 app = Flask(__name__)
 CORS(app)
 
-# ─── Init YTMusic (tanpa auth = public data aja, cukup buat trending & search) ─
+# ─── Init YTMusic ─────────────────────────────────────────────────────────────
 ytmusic = YTMusic()
 
 # ─── Simple in-memory cache ───────────────────────────────────────────────────
@@ -29,76 +29,148 @@ def cache_set(key, data, ttl=1800):
     with _cache_lock:
         _cache[key] = {"data": data, "expires": time.time() + ttl}
 
+# ─── Helper: safe thumbnail extraction ───────────────────────────────────────
+def get_thumbnail(song_obj, video_id=""):
+    """
+    Ambil thumbnail dari object lagu ytmusicapi.
+    Coba 'thumbnails' (search/playlist) dan 'thumbnail' (watch playlist).
+    Fallback ke YouTube direct URL jika ada videoId.
+    """
+    # ytmusicapi search results pake 'thumbnails' (list of dict)
+    thumbs = song_obj.get("thumbnails") or song_obj.get("thumbnail") or []
+
+    if isinstance(thumbs, list) and thumbs:
+        last = thumbs[-1]
+        if isinstance(last, dict) and last.get("url"):
+            url = last["url"]
+            # Clean up size param dari Google CDN (opsional, untuk resolusi lebih tinggi)
+            # Format: https://lh3.googleusercontent.com/...=w226-h226-l90-rj
+            # Ganti ukuran ke yang lebih gede kalau ada
+            if "=w" in url and "-h" in url:
+                base = url.split("=w")[0]
+                return base + "=w500-h500-l90-rj"
+            return url
+
+    # Fallback: pakai YouTube thumbnail langsung via videoId
+    vid = video_id or song_obj.get("videoId", "")
+    if vid:
+        return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+    return ""
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def health():
     return jsonify({"status": "ok", "service": "id-muzix-python"})
 
-# ─── GET /trending — chart Indonesia (Workaround pakai Search) ───────────────
+# ─── GET /trending ────────────────────────────────────────────────────────────
 @app.route("/trending")
 def trending():
     cached = cache_get("trending_id")
     if cached:
         return jsonify(cached)
 
+    result = []
+
+    # ── Strategy 1: get_charts('ID') → ambil playlist → get tracks ───────────
     try:
-        # WORKAROUND: Kita akali dengan mencari playlist/lagu viral
-        # karena get_charts() sering kosong/diblokir di server
-        results = ytmusic.search("lagu viral tiktok indonesia terbaru", filter="songs", limit=20)
+        charts = ytmusic.get_charts(country="ID")
+        # 'videos' berisi list playlist chart (bukan individual songs)
+        chart_videos = charts.get("videos", [])
 
-        if not results:
-            return jsonify({"error": "Trending kosong, pencarian tidak menemukan hasil"}), 500
+        if isinstance(chart_videos, list) and chart_videos:
+            playlist_id = chart_videos[0].get("playlistId", "")
+            if playlist_id:
+                playlist = ytmusic.get_playlist(playlist_id, limit=20)
+                tracks = playlist.get("tracks", [])
 
-        result = []
-        for i, song in enumerate(results):
-            try:
-                title = song.get("title", "")
-                
-                # Parsing artist dengan aman
-                artists = song.get("artists", [])
-                if isinstance(artists, list) and artists:
-                    first = artists[0]
-                    artist = first.get("name", "") if isinstance(first, dict) else str(first)
-                else:
-                    artist = ""
+                for i, track in enumerate(tracks):
+                    try:
+                        title    = track.get("title", "")
+                        artists  = track.get("artists", []) or []
+                        artist   = ""
+                        if isinstance(artists, list) and artists:
+                            first  = artists[0]
+                            artist = first.get("name", "") if isinstance(first, dict) else str(first)
 
-                videoId = song.get("videoId", "")
+                        video_id  = track.get("videoId", "")
+                        thumbnail = get_thumbnail(track, video_id)
 
-                # Parsing thumbnail
-                thumbnails = song.get("thumbnails", [])
-                thumbnail = thumbnails[-1]["url"] if thumbnails and isinstance(thumbnails[-1], dict) else ""
+                        if not title:
+                            continue
 
-                # Parsing album
-                album_obj = song.get("album", {})
-                album = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
+                        result.append({
+                            "rank":      i + 1,
+                            "title":     title,
+                            "artist":    artist,
+                            "thumbnail": thumbnail,
+                            "videoId":   video_id,
+                            "query":     f"{title} {artist}".strip(),
+                        })
+                    except Exception as e:
+                        print(f"[Charts/Playlist] skip track {i}: {e}")
+                        continue
 
-                if not title:
-                    continue
-
-                result.append({
-                    "rank":      i + 1,
-                    "title":     title,
-                    "artist":    artist,
-                    "album":     album,
-                    "thumbnail": thumbnail,
-                    "videoId":   videoId,
-                    "query":     f"{title} {artist}".strip(),
-                })
-            except Exception as e:
-                print(f"[Trending] skip item {i}: {e}")
-                continue
-
-        if not result:
-            return jsonify({"error": "Gagal memproses data trending"}), 500
-
-        cache_set("trending_id", result, ttl=1800) # Cache 30 menit
-        return jsonify(result)
+        print(f"[Charts] berhasil: {len(result)} lagu dari chart ID")
 
     except Exception as e:
-        print(f"[Trending] ERROR: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"[Charts] get_charts gagal: {e}, lanjut ke fallback search")
 
-# ─── GET /related?q=title&artist=artist — related songs ───────────────────────
+    # ── Strategy 2: fallback ke multiple search queries ───────────────────────
+    if len(result) < 10:
+        search_queries = [
+            "lagu viral tiktok indonesia terbaru",
+            "top hits indonesia 2025",
+            "lagu pop indonesia populer 2025",
+        ]
+        seen_titles = {r["title"].lower() for r in result}
+
+        for sq in search_queries:
+            if len(result) >= 20:
+                break
+            try:
+                songs = ytmusic.search(sq, filter="songs", limit=20)
+                for song in songs:
+                    try:
+                        title = song.get("title", "")
+                        if not title or title.lower() in seen_titles:
+                            continue
+
+                        artists = song.get("artists", []) or []
+                        artist  = ""
+                        if isinstance(artists, list) and artists:
+                            first  = artists[0]
+                            artist = first.get("name", "") if isinstance(first, dict) else str(first)
+
+                        video_id  = song.get("videoId", "")
+                        thumbnail = get_thumbnail(song, video_id)
+
+                        result.append({
+                            "rank":      len(result) + 1,
+                            "title":     title,
+                            "artist":    artist,
+                            "thumbnail": thumbnail,
+                            "videoId":   video_id,
+                            "query":     f"{title} {artist}".strip(),
+                        })
+                        seen_titles.add(title.lower())
+
+                        if len(result) >= 20:
+                            break
+                    except Exception as e:
+                        print(f"[Trending Fallback] skip item: {e}")
+                        continue
+            except Exception as e:
+                print(f"[Trending Fallback] query '{sq}' gagal: {e}")
+                continue
+
+    if not result:
+        return jsonify({"error": "Gagal memproses data trending"}), 500
+
+    cache_set("trending_id", result, ttl=1800)
+    return jsonify(result)
+
+# ─── GET /related?q=title&artist=artist ───────────────────────────────────────
 @app.route("/related")
 def related():
     q      = request.args.get("q", "").strip()
@@ -107,14 +179,13 @@ def related():
         return jsonify({"error": "q is required"}), 400
 
     cache_key = f"related_{q.lower()}_{artist.lower()}"
-    cached = cache_get(cache_key)
+    cached    = cache_get(cache_key)
     if cached:
         return jsonify(cached)
 
     try:
-        # Search lagu, ambil yang paling relevan
         search_query = f"{q} {artist}".strip()
-        results = ytmusic.search(search_query, filter="songs", limit=1)
+        results      = ytmusic.search(search_query, filter="songs", limit=1)
 
         if not results:
             return jsonify([])
@@ -123,19 +194,20 @@ def related():
         if not video_id:
             return jsonify([])
 
-        # Ambil watch playlist (related songs dari YT Music radio)
-        watch = ytmusic.get_watch_playlist(videoId=video_id, limit=10)
+        watch  = ytmusic.get_watch_playlist(videoId=video_id, limit=12)
         tracks = watch.get("tracks", [])[1:]  # skip lagu pertama (lagu itu sendiri)
 
         related_songs = []
         for track in tracks:
             try:
-                title      = track.get("title", "")
-                artists    = track.get("artists", [])
-                t_artist   = artists[0]["name"] if artists else ""
-                vid        = track.get("videoId", "")
-                thumbnails = track.get("thumbnail", [])
-                thumbnail  = thumbnails[-1]["url"] if thumbnails else ""
+                title     = track.get("title", "")
+                artists   = track.get("artists", []) or []
+                t_artist  = artists[0]["name"] if artists and isinstance(artists[0], dict) else ""
+                vid       = track.get("videoId", "")
+                thumbnail = get_thumbnail(track, vid)
+
+                if not title:
+                    continue
 
                 related_songs.append({
                     "title":     title,
@@ -148,14 +220,14 @@ def related():
                 print(f"[Related] skip track: {e}")
                 continue
 
-        cache_set(cache_key, related_songs, ttl=600)  # cache 10 menit
+        cache_set(cache_key, related_songs, ttl=600)
         return jsonify(related_songs)
 
     except Exception as e:
         print(f"[Related] ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ─── GET /metadata?q=query — thumbnail + artist + album dari YT Music ─────────
+# ─── GET /metadata?q=query ────────────────────────────────────────────────────
 @app.route("/metadata")
 def metadata():
     q = request.args.get("q", "").strip()
@@ -163,7 +235,7 @@ def metadata():
         return jsonify({"error": "q is required"}), 400
 
     cache_key = f"meta_{q.lower()}"
-    cached = cache_get(cache_key)
+    cached    = cache_get(cache_key)
     if cached:
         return jsonify(cached)
 
@@ -172,26 +244,24 @@ def metadata():
         if not results:
             return jsonify({"error": "not found"}), 404
 
-        song       = results[0]
-        title      = song.get("title", q)
-        artists    = song.get("artists", [])
-        artist     = artists[0]["name"] if artists else ""
-        album_obj  = song.get("album") or {}
-        album      = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
-        videoId    = song.get("videoId", "")
-        thumbnails = song.get("thumbnails", [])
-        # Ambil thumbnail resolusi tertinggi
-        thumbnail  = thumbnails[-1]["url"] if thumbnails else ""
+        song      = results[0]
+        title     = song.get("title", q)
+        artists   = song.get("artists", []) or []
+        artist    = artists[0]["name"] if artists and isinstance(artists[0], dict) else ""
+        album_obj = song.get("album") or {}
+        album     = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
+        video_id  = song.get("videoId", "")
+        thumbnail = get_thumbnail(song, video_id)
 
         result = {
             "title":     title,
             "artist":    artist,
             "album":     album,
             "thumbnail": thumbnail,
-            "videoId":   videoId,
+            "videoId":   video_id,
         }
 
-        cache_set(cache_key, result, ttl=3600)  # cache 1 jam
+        cache_set(cache_key, result, ttl=3600)
         return jsonify(result)
 
     except Exception as e:

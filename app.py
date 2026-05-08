@@ -2,6 +2,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from ytmusicapi import YTMusic
 import os
+import re
 import time
 import threading
 
@@ -29,146 +30,126 @@ def cache_set(key, data, ttl=1800):
     with _cache_lock:
         _cache[key] = {"data": data, "expires": time.time() + ttl}
 
-# ─── Helper: safe thumbnail extraction ───────────────────────────────────────
-def get_thumbnail(song_obj, video_id=""):
-    """
-    Ambil thumbnail dari object lagu ytmusicapi.
-    Coba 'thumbnails' (search/playlist) dan 'thumbnail' (watch playlist).
-    Fallback ke YouTube direct URL jika ada videoId.
-    """
-    # ytmusicapi search results pake 'thumbnails' (list of dict)
-    thumbs = song_obj.get("thumbnails") or song_obj.get("thumbnail") or []
+# ─── Helper: clean_thumbnail ──────────────────────────────────────────────────
+# PORT dari main.py project lama — lebih robust dari versi sebelumnya:
+#   1. Sort by width*height, bukan ambil index [-1]
+#   2. Handle 2 format CDN: lh3.googleusercontent.com dan i.ytimg.com
+#   3. Upgrade resolusi otomatis via regex
+#   4. Hard fallback ke ytimg URL kalau ada videoId
+def clean_thumbnail(thumbnails: list, video_id: str = "") -> str:
+    if not thumbnails:
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
 
-    if isinstance(thumbs, list) and thumbs:
-        last = thumbs[-1]
-        if isinstance(last, dict) and last.get("url"):
-            url = last["url"]
-            # Clean up size param dari Google CDN (opsional, untuk resolusi lebih tinggi)
-            # Format: https://lh3.googleusercontent.com/...=w226-h226-l90-rj
-            # Ganti ukuran ke yang lebih gede kalau ada
-            if "=w" in url and "-h" in url:
-                base = url.split("=w")[0]
-                return base + "=w500-h500-l90-rj"
-            return url
+    sorted_thumbs = sorted(
+        [t for t in thumbnails if isinstance(t, dict)],
+        key=lambda x: x.get("width", 0) * x.get("height", 0),
+        reverse=True
+    )
+    if not sorted_thumbs:
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
 
-    # Fallback: pakai YouTube thumbnail langsung via videoId
-    vid = video_id or song_obj.get("videoId", "")
-    if vid:
-        return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    url = sorted_thumbs[0].get("url", "")
+    if not url:
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
 
-    return ""
+    # lh3.googleusercontent.com: =w226-h226-l90-rj → =w500-h500-l90-rj
+    if "lh3.googleusercontent.com" in url:
+        return re.sub(r"=w\d+-h\d+", "=w500-h500", url)
+
+    # i.ytimg.com: hqdefault → maxresdefault
+    if "i.ytimg.com" in url:
+        return re.sub(r"/(hqdefault|mqdefault|sddefault|default)(\.jpg)", r"/maxresdefault\2", url)
+
+    return re.sub(r"=w\d+-h\d+", "=w500-h500", url)
+
+
+# ─── Helper: parse satu track ytmusicapi → dict bersih ───────────────────────
+# PORT dari ytm_track_to_dict di main.py — termasuk album thumbnail fallback
+def ytm_track_to_dict(track: dict) -> dict:
+    try:
+        thumbnails = track.get("thumbnails") or []
+        if not thumbnails and track.get("album"):
+            thumbnails = track["album"].get("thumbnails") or []
+
+        video_id    = track.get("videoId", "")
+        artists     = track.get("artists") or []
+        artist_name = ", ".join(
+            [a.get("name", "") for a in artists if isinstance(a, dict)]
+        ) if artists else ""
+
+        album_obj = track.get("album") or {}
+        album     = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
+
+        return {
+            "rank":      0,
+            "title":     track.get("title", ""),
+            "artist":    artist_name,
+            "album":     album,
+            "thumbnail": clean_thumbnail(thumbnails, video_id),
+            "videoId":   video_id,
+            "query":     f"{track.get('title', '')} {artist_name}".strip(),
+        }
+    except Exception as e:
+        print(f"[ytm_track_to_dict] error: {e}")
+        return {}
+
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def health():
     return jsonify({"status": "ok", "service": "id-muzix-python"})
 
+
 # ─── GET /trending ────────────────────────────────────────────────────────────
+#
+# ⚠️  KENAPA TIDAK PAKAI get_charts():
+#   ytmusicapi v1.11.5+ mengubah get_charts() — sekarang return PLAYLIST OBJECTS
+#   bukan individual tracks. Kalau tetap pakai, kita dapat data playlist bukan
+#   lagu, dan thumbnail/videoId-nya kosong.
+#
+#   Fix proven dari project lain: gunakan search() multi-query sebagai proxy
+#   trending. Hasilnya lebih konsisten dan ga kena breaking change.
+#
 @app.route("/trending")
 def trending():
     cached = cache_get("trending_id")
     if cached:
         return jsonify(cached)
 
-    result = []
+    TRENDING_QUERIES = [
+        "trending musik indonesia 2026",
+        "lagu viral indonesia 2026",
+        "hits terbaru indonesia 2026",
+    ]
 
-    # ── Strategy 1: get_charts('ID') → ambil playlist → get tracks ───────────
-    try:
-        charts = ytmusic.get_charts(country="ID")
-        # 'videos' berisi list playlist chart (bukan individual songs)
-        chart_videos = charts.get("videos", [])
+    result   = []
+    seen_ids = set()
 
-        if isinstance(chart_videos, list) and chart_videos:
-            playlist_id = chart_videos[0].get("playlistId", "")
-            if playlist_id:
-                playlist = ytmusic.get_playlist(playlist_id, limit=20)
-                tracks = playlist.get("tracks", [])
-
-                for i, track in enumerate(tracks):
-                    try:
-                        title    = track.get("title", "")
-                        artists  = track.get("artists", []) or []
-                        artist   = ""
-                        if isinstance(artists, list) and artists:
-                            first  = artists[0]
-                            artist = first.get("name", "") if isinstance(first, dict) else str(first)
-
-                        video_id  = track.get("videoId", "")
-                        thumbnail = get_thumbnail(track, video_id)
-
-                        if not title:
-                            continue
-
-                        result.append({
-                            "rank":      i + 1,
-                            "title":     title,
-                            "artist":    artist,
-                            "thumbnail": thumbnail,
-                            "videoId":   video_id,
-                            "query":     f"{title} {artist}".strip(),
-                        })
-                    except Exception as e:
-                        print(f"[Charts/Playlist] skip track {i}: {e}")
-                        continue
-
-        print(f"[Charts] berhasil: {len(result)} lagu dari chart ID")
-
-    except Exception as e:
-        print(f"[Charts] get_charts gagal: {e}, lanjut ke fallback search")
-
-    # ── Strategy 2: fallback ke multiple search queries ───────────────────────
-    if len(result) < 10:
-        search_queries = [
-            "lagu viral tiktok indonesia terbaru",
-            "top hits indonesia 2025",
-            "lagu pop indonesia populer 2025",
-        ]
-        seen_titles = {r["title"].lower() for r in result}
-
-        for sq in search_queries:
-            if len(result) >= 20:
-                break
-            try:
-                songs = ytmusic.search(sq, filter="songs", limit=20)
-                for song in songs:
-                    try:
-                        title = song.get("title", "")
-                        if not title or title.lower() in seen_titles:
-                            continue
-
-                        artists = song.get("artists", []) or []
-                        artist  = ""
-                        if isinstance(artists, list) and artists:
-                            first  = artists[0]
-                            artist = first.get("name", "") if isinstance(first, dict) else str(first)
-
-                        video_id  = song.get("videoId", "")
-                        thumbnail = get_thumbnail(song, video_id)
-
-                        result.append({
-                            "rank":      len(result) + 1,
-                            "title":     title,
-                            "artist":    artist,
-                            "thumbnail": thumbnail,
-                            "videoId":   video_id,
-                            "query":     f"{title} {artist}".strip(),
-                        })
-                        seen_titles.add(title.lower())
-
-                        if len(result) >= 20:
-                            break
-                    except Exception as e:
-                        print(f"[Trending Fallback] skip item: {e}")
-                        continue
-            except Exception as e:
-                print(f"[Trending Fallback] query '{sq}' gagal: {e}")
-                continue
+    for query in TRENDING_QUERIES:
+        if len(result) >= 20:
+            break
+        try:
+            songs = ytmusic.search(query, filter="songs", limit=15)
+            for song in songs:
+                track = ytm_track_to_dict(song)
+                vid   = track.get("videoId", "")
+                if not vid or vid in seen_ids or not track.get("title"):
+                    continue
+                seen_ids.add(vid)
+                track["rank"] = len(result) + 1
+                result.append(track)
+                if len(result) >= 20:
+                    break
+        except Exception as e:
+            print(f"[Trending] query '{query}' gagal: {e}")
+            continue
 
     if not result:
         return jsonify({"error": "Gagal memproses data trending"}), 500
 
     cache_set("trending_id", result, ttl=1800)
     return jsonify(result)
+
 
 # ─── GET /related?q=title&artist=artist ───────────────────────────────────────
 @app.route("/related")
@@ -186,7 +167,6 @@ def related():
     try:
         search_query = f"{q} {artist}".strip()
         results      = ytmusic.search(search_query, filter="songs", limit=1)
-
         if not results:
             return jsonify([])
 
@@ -195,30 +175,13 @@ def related():
             return jsonify([])
 
         watch  = ytmusic.get_watch_playlist(videoId=video_id, limit=12)
-        tracks = watch.get("tracks", [])[1:]  # skip lagu pertama (lagu itu sendiri)
+        tracks = watch.get("tracks", [])[1:]
 
         related_songs = []
         for track in tracks:
-            try:
-                title     = track.get("title", "")
-                artists   = track.get("artists", []) or []
-                t_artist  = artists[0]["name"] if artists and isinstance(artists[0], dict) else ""
-                vid       = track.get("videoId", "")
-                thumbnail = get_thumbnail(track, vid)
-
-                if not title:
-                    continue
-
-                related_songs.append({
-                    "title":     title,
-                    "artist":    t_artist,
-                    "thumbnail": thumbnail,
-                    "videoId":   vid,
-                    "query":     f"{title} {t_artist}".strip(),
-                })
-            except Exception as e:
-                print(f"[Related] skip track: {e}")
-                continue
+            item = ytm_track_to_dict(track)
+            if item.get("videoId") and item.get("title"):
+                related_songs.append(item)
 
         cache_set(cache_key, related_songs, ttl=600)
         return jsonify(related_songs)
@@ -226,6 +189,7 @@ def related():
     except Exception as e:
         print(f"[Related] ERROR: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 # ─── GET /metadata?q=query ────────────────────────────────────────────────────
 @app.route("/metadata")
@@ -244,29 +208,17 @@ def metadata():
         if not results:
             return jsonify({"error": "not found"}), 404
 
-        song      = results[0]
-        title     = song.get("title", q)
-        artists   = song.get("artists", []) or []
-        artist    = artists[0]["name"] if artists and isinstance(artists[0], dict) else ""
-        album_obj = song.get("album") or {}
-        album     = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
-        video_id  = song.get("videoId", "")
-        thumbnail = get_thumbnail(song, video_id)
+        track = ytm_track_to_dict(results[0])
+        if not track:
+            return jsonify({"error": "Gagal parse track"}), 500
 
-        result = {
-            "title":     title,
-            "artist":    artist,
-            "album":     album,
-            "thumbnail": thumbnail,
-            "videoId":   video_id,
-        }
-
-        cache_set(cache_key, result, ttl=3600)
-        return jsonify(result)
+        cache_set(cache_key, track, ttl=3600)
+        return jsonify(track)
 
     except Exception as e:
         print(f"[Metadata] ERROR: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
